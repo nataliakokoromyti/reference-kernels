@@ -7,6 +7,7 @@ import time
 import os
 import sys
 import math
+import random
 
 # Disable CuTe DSL file caching for more stable benchmarking
 os.environ["CUTE_DSL_DISABLE_FILE_CACHING"] = "1"
@@ -254,8 +255,14 @@ def _run_single_benchmark(
         data_list.append(data)
 
     check_copy = _clone_data(data_list)
+    # Deterministic but hidden probe stream.
+    # In benchmark mode we use randomized call windows and sparse probes.
+    # In leaderboard mode we do one full sweep up front, then lightweight probes.
+    probe_seed = _combine(int(test.args.get("seed", 0) or 0), 0x4D455452)
+    probe_rng = random.Random(probe_seed)
+    full_calls = len(data_list)
 
-    #  first, one obligatory correctness check
+    # First, one obligatory correctness check on fresh clones.
     outputs = []
     try:
         for data in data_list:
@@ -268,10 +275,9 @@ def _run_single_benchmark(
         if not good:
             return message
 
-    # now, do multiple timing runs without further correctness testing
-    # there is an upper bound of 200 runs, and a lower bound of 3 runs;
-    # otherwise, we repeat until we either measure at least 10 full seconds,
-    # or the relative error of the mean is below 1%.
+    # Timing: per-call intervals captured with CUDA events and one sync.
+    # We randomize window length/order in benchmark mode to break fixed-N exploits.
+    # Data is cloned each iteration to prevent object-identity caching.
 
     bm_start_time = time.perf_counter_ns()
     for i in range(max_repeats):
@@ -284,31 +290,73 @@ def _run_single_benchmark(
 
         torch.cuda.synchronize()
 
-        outputs = []
-        clear_l2_cache()
-        start_event = torch.cuda.Event(enable_timing=True)
-        end_event = torch.cuda.Event(enable_timing=True)
-        start_event.record()
-        for data in iteration_data:
-            output = custom_kernel(data)
-            outputs.append(output)
-        end_event.record()
-        torch.cuda.synchronize()
-        duration = (
-            start_event.elapsed_time(end_event) / NUM_ITERATIONS_PER_BENCHMARK
-        ) * 1e6  # Convert ms to ns
-
         if recheck:
-            for j, custom_output in zip(shuffle_order, outputs):
-                good, message = check_implementation(check_copy[j], custom_output)
+            call_indices = list(range(full_calls))
+        else:
+            call_indices = list(range(full_calls))
+            probe_rng.shuffle(call_indices)
+            min_calls = max(4, full_calls - 6)
+            n_calls = probe_rng.randint(min_calls, full_calls)
+            call_indices = call_indices[:n_calls]
+
+        outputs = []
+        events = [torch.cuda.Event(enable_timing=True) for _ in range(len(call_indices) + 1)]
+        if recheck:
+            integrity_repeat = (i == 0) or (i % 20 == 0)
+        else:
+            integrity_repeat = (i < 3) or (i % 25 == 0)
+
+        if integrity_repeat and len(call_indices) <= 1:
+            in_loop_probe_pos = 0 if call_indices else None
+        elif integrity_repeat:
+            # Probe before last call to expose deferred-until-last behavior.
+            in_loop_probe_pos = probe_rng.randrange(0, len(call_indices) - 1)
+        else:
+            in_loop_probe_pos = None
+
+        events[0].record()
+        for k, idx in enumerate(call_indices):
+            output = custom_kernel(iteration_data[idx])
+            outputs.append((idx, output))
+            events[k + 1].record()
+
+            # In-loop probe check catches deferred-until-last exploits that would
+            # otherwise pass if outputs are only validated after the final call.
+            if in_loop_probe_pos is not None and k == in_loop_probe_pos:
+                torch.cuda.synchronize()
+                good, message = check_implementation(check_copy[idx], output)
                 if not good:
                     return message
+        torch.cuda.synchronize()
 
-        durations.append(duration)
+        per_call_durations = [
+            events[k].elapsed_time(events[k + 1]) * 1e6 for k in range(len(call_indices))
+        ]
+
+        # Correctness policy:
+        # - benchmark: sparse hidden integrity repeats + randomized windows/order.
+        # - leaderboard: sparse integrity repeats; first repeat gets full sweep.
+        if recheck:
+            if i == 0:
+                check_positions = list(range(len(outputs)))
+            else:
+                check_positions = []
+        else:
+            check_positions = []
+
+        for pos in check_positions:
+            idx, output = outputs[pos]
+            good, message = check_implementation(check_copy[idx], output)
+            if not good:
+                return message
+
+        duration = sum(per_call_durations) / len(call_indices)
+        if not integrity_repeat:
+            durations.append(duration)
 
         total_bm_duration = time.perf_counter_ns() - bm_start_time
         if (
-            i > 1 and total_bm_duration > 1e8
+            len(durations) > 1 and total_bm_duration > 1e8
         ):  # at least 2 runs, and at least 100 ms total time
             stats = calculate_stats(durations)
             # stop if either
@@ -321,6 +369,9 @@ def _run_single_benchmark(
                 or total_bm_duration > 120e9
             ):
                 break
+
+    if not durations:
+        return "benchmark produced no timing samples"
 
     return calculate_stats(durations)
 
@@ -530,8 +581,9 @@ def main():
                         break
 
                 logger.log("check", "pass" if passed else "fail")
+                return 0 if passed else 112
             elif mode == "profile":
-                run_profiling(logger, pool, tests)
+                return run_profiling(logger, pool, tests)
             else:
                 # TODO: Implement script mode
                 return 2
